@@ -345,6 +345,26 @@ class BLEDevice:
                     temp_float = struct.unpack('>f', data[offset:offset+4])[0]
                     temperature_channels.append(temp_float)
             
+            def _norm_validation_byte(v):
+                try:
+                    # v is an int (byte) or bytes
+                    if isinstance(v, (bytes, bytearray)):
+                        if len(v) == 1:
+                            return v[0] - 48 if 48 <= v[0] <= 57 else int(v[0])
+                        try:
+                            return int(v.decode(errors='ignore'))
+                        except Exception:
+                            return 0
+                    if isinstance(v, int):
+                        if v in (48, 49):
+                            return v - 48
+                        return v
+                    if isinstance(v, str):
+                        return int(v) if v.isdigit() else 0
+                except Exception:
+                    return 0
+                return 0
+
             response = {
                 'req_type': data[0],
                 'packet_length': packet_length,
@@ -353,7 +373,7 @@ class BLEDevice:
                 'data_set': data[5],
                 'date_time': bytes(data[6:18]).decode('ascii', errors='ignore').rstrip('\x00'),
                 'temperature_data': temperature_channels,
-                'validation_status': data[210],
+                'validation_status': _norm_validation_byte(data[210]),
                 'battery_percentage': data[211],
                 'checksum': data[212]
             }

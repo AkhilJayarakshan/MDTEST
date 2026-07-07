@@ -12,6 +12,7 @@ import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
+import math
 import sys
 
 from ble_manager import BLEManager, BLE_AVAILABLE
@@ -40,10 +41,18 @@ class MDAQApp(tk.Tk):
     ERROR_CODE_MAP = {
         1: "Battery low",
         2: "DAQ ID mismatch",
-        3: "Wearable ID mismatch",
+        4: "Wearable ID mismatch",
         8: "UHI ID mismatch",
         16: "Wearable size mismatch",
     }
+
+    @staticmethod
+    def decode_error_code(code: int) -> list[str]:
+        errors = []
+        for bit, label in MDAQApp.ERROR_CODE_MAP.items():
+            if code & bit:
+                errors.append(label)
+        return errors
 
     def __init__(self):
         super().__init__()
@@ -74,6 +83,12 @@ class MDAQApp(tk.Tk):
             pass
 
         self.settings = load_settings()
+        self.settings.setdefault("history", {})
+        self.settings.setdefault("channel_map", {})
+        for size, default_channels in WD_CHANNELS.items():
+            if size not in self.settings["channel_map"] or not isinstance(self.settings["channel_map"][size], list):
+                self.settings["channel_map"][size] = default_channels.copy()
+        save_settings(self.settings)
         Path(self.settings["download_path"]).mkdir(parents=True, exist_ok=True)
 
         self.ble_q: queue.Queue = queue.Queue()
@@ -83,6 +98,7 @@ class MDAQApp(tk.Tk):
         self.connected_name: str = ""
         self._ble_connected_state: bool = False
         self.notifications: list[dict] = []
+        self._page_history: list[str] = []
         self.unseen_notif_count: int = 0
         self.bi_registered: bool = False
         self.device_info: dict = {}
@@ -97,9 +113,17 @@ class MDAQApp(tk.Tk):
         self._retrieve_timer = None
         self.current_page = ""
         self.nav_buttons = {}  # Store button references for highlighting
+        self._pending_retrieve_uhid: str | None = None
+        self._pending_retrieve_path: str | None = None
+        self._pending_retrieve_wd_size: str | None = None
+        self._pending_retrieve_waiting_for_basic_info: bool = False
+        self._pending_retrieve_after_basic_info_timer = None
+        self._pending_initiation_response: bool = False
+        self._pending_initiation_timer = None
 
         self._style()
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_app_close)
         self._show_welcome()
         self._poll_queue()
 
@@ -125,9 +149,11 @@ class MDAQApp(tk.Tk):
                      font=("Segoe UI", 13))
         s.configure("TCombobox",     fieldbackground=C["entry_bg"], foreground=C["text"],
                      selectbackground=C["accent"], selectforeground=C["bg"],
-                     font=("Segoe UI", 13))
+                     insertcolor=C["accent"], arrowcolor=C["text"],
+                     background=C["entry_bg"], font=("Segoe UI", 13))
         s.map("TCombobox",           fieldbackground=[("readonly", C["entry_bg"])],
-              foreground=[("readonly", C["text"])])
+              foreground=[("readonly", C["text"])],
+              arrowcolor=[("!disabled", C["text"]), ("disabled", C["subtext"])])
         s.configure("Treeview",      background=C["panel"], foreground=C["text"],
                      fieldbackground=C["panel"], rowheight=40,
                      font=("Segoe UI", 12))
@@ -135,6 +161,48 @@ class MDAQApp(tk.Tk):
                      font=("Segoe UI", 12, "bold"))
         s.map("Treeview", background=[("selected", C["accent"])],
               foreground=[("selected", C["bg"])])
+
+    def _get_history_values(self, key: str, max_items: int = 2) -> list[str]:
+        history = self.settings.get("history", {}) or {}
+        values = history.get(key, [])
+        return values[:max_items]
+
+    def _push_history_value(self, key: str, value: str, max_items: int = 2):
+        if not value:
+            return
+        value = str(value).strip()
+        if not value:
+            return
+        history = self.settings.setdefault("history", {})
+        items = history.get(key, [])
+        if value in items:
+            items.remove(value)
+        items.insert(0, value)
+        history[key] = items[:max_items]
+        save_settings(self.settings)
+
+    def _make_history_combobox(self, parent, textvariable, key: str, width=30, state="normal"):
+        cb = ttk.Combobox(parent, textvariable=textvariable,
+                          values=self._get_history_values(key),
+                          width=width,
+                          state=state)
+
+        def _activate(cb_widget, cb_key: str):
+            cb_widget.configure(values=self._get_history_values(cb_key))
+            try:
+                cb_widget.focus_set()
+            except Exception:
+                pass
+
+        cb.bind("<FocusIn>", lambda e, cb_widget=cb, cb_key=key: _activate(cb_widget, cb_key))
+        cb.bind("<Button-1>", lambda e, cb_widget=cb, cb_key=key: _activate(cb_widget, cb_key))
+        cb.bind("<KeyRelease>", lambda e, cb_widget=cb, cb_key=key: _activate(cb_widget, cb_key))
+        try:
+            cb.configure(cursor="xterm")
+            cb.configure(insertbackground=self.C["accent"])
+        except Exception:
+            pass
+        return cb
 
     # ─────────────────────────────────────────────────────────────────────────
     def _add_mousewheel_bindings(self, widget, is_text: bool = False):
@@ -211,6 +279,8 @@ class MDAQApp(tk.Tk):
         self._build_retrieve_page()
         self._build_notifications_page()
         self._build_settings_page()
+        self._build_about_page()
+        self._build_channel_mapping_page()
 
     # ─────────────────────────────────────────────────────────────────────────
     #  SIDEBAR
@@ -222,9 +292,43 @@ class MDAQApp(tk.Tk):
         # logo area
         logo_frame = tk.Frame(sb, bg=C["panel"], pady=18)
         logo_frame.pack(fill="x")
-        tk.Label(logo_frame, text="⬡ MDAQ", bg=C["panel"],
-             fg=C["accent"], font=("Segoe UI", 28, "bold")).pack()
-        tk.Label(logo_frame, text="v1.0.0", bg=C["panel"],
+        # Try multiple possible logo image filenames (user-provided screenshot preferred)
+        logo_dir = Path(__file__).resolve().parent
+        candidates = [
+            logo_dir / "Screenshot 2026-07-07 010121.png",
+            logo_dir / "ChatGPT Image Jul 7, 2026, 12_28_22 AM.png",
+            logo_dir / "ChatGPT Image Jul 5, 2026, 11_10_34 PM.png",
+        ]
+        found = None
+        for p in candidates:
+            if p.exists():
+                found = p
+                break
+        if not found:
+            # fallback to any Screenshot*.png in the folder
+            for p in logo_dir.glob("Screenshot*.png"):
+                found = p
+                break
+        if found:
+            try:
+                img = tk.PhotoImage(file=str(found))
+                max_width = 360
+                max_height = 120
+                w, h = img.width(), img.height()
+                scale_w = math.ceil(w / max_width) if w > max_width else 1
+                scale_h = math.ceil(h / max_height) if h > max_height else 1
+                scale = max(1, scale_w, scale_h)
+                if scale > 1:
+                    img = img.subsample(scale, scale)
+                self.sidebar_logo = img
+                tk.Label(logo_frame, image=self.sidebar_logo, bg=C["panel"]).pack()
+            except Exception:
+                tk.Label(logo_frame, text="⬡ MDAQ", bg=C["panel"],
+                     fg=C["accent"], font=("Segoe UI", 28, "bold")).pack()
+        else:
+            tk.Label(logo_frame, text="⬡ MDAQ", bg=C["panel"],
+                 fg=C["accent"], font=("Segoe UI", 28, "bold")).pack()
+        tk.Label(logo_frame, text="v1.2.0", bg=C["panel"],
              fg=C["subtext"], font=("Segoe UI", 11)).pack()
 
         ttk.Separator(sb, orient="horizontal").pack(fill="x", padx=10)
@@ -318,7 +422,15 @@ class MDAQApp(tk.Tk):
                        activebackground=C["bg"],
                        activeforeground=C["accent"],
                        font=("Segoe UI", 13, "bold"),
-                       padx=8, pady=6).pack()
+                       padx=8, pady=6).pack(side="left")
+
+        tk.Button(mon_frame, text="About",
+                  command=lambda: self._show_page("about"),
+                  bg=C["border"], fg=C["text"],
+                  activebackground=C["accent"],
+                  activeforeground=C["bg"],
+                  relief="flat", cursor="hand2",
+                  font=("Segoe UI", 10), padx=1, pady=0.1).pack(side="right", padx=(1, 0))
 
     def _top_nav_btn(self, parent, text, cmd, state="normal"):
         C = self.C
@@ -410,7 +522,13 @@ class MDAQApp(tk.Tk):
     # ─────────────────────────────────────────────────────────────────────────
     #  PAGE SWITCHER
     # ─────────────────────────────────────────────────────────────────────────
-    def _show_page(self, name: str):
+    def _show_page(self, name: str, record_history: bool = True):
+        # maintain history so Back buttons can return to the last visited page
+        current = getattr(self, "_current_page", None)
+        if record_history and current and current != name:
+            self._page_history.append(current)
+        self._current_page = name
+
         # Hide top nav for welcome page, show for others
         if name == "welcome":
             self.top_nav.grid_remove()
@@ -429,6 +547,13 @@ class MDAQApp(tk.Tk):
             self.unseen_notif_count = 0
             self._refresh_notif_badge()
             self._refresh_notifications()
+
+    def _go_back(self):
+        if self._page_history:
+            previous = self._page_history.pop()
+            self._show_page(previous, record_history=False)
+        else:
+            self._show_page("home", record_history=False)
 
     def _update_nav_button_states(self, active_page: str):
         """Highlight the active navigation button in blue"""
@@ -465,15 +590,18 @@ class MDAQApp(tk.Tk):
         inner = tk.Frame(f, bg=C["bg"])
         inner.place(relx=0.5, rely=0.5, anchor="center")
 
-        tk.Label(inner, text="⬡", bg=C["bg"], fg=C["accent"],
-                 font=("Segoe UI", 96)).pack()
-        tk.Label(inner, text="MDAQ", bg=C["bg"], fg=C["text"],
-                 font=("Segoe UI", 56, "bold")).pack()
-        tk.Label(inner, text="Multi-Channel Data Acquisition System",
-                 bg=C["bg"], fg=C["subtext"],
-                 font=("Segoe UI", 16)).pack(pady=(8, 20))
-        tk.Label(inner, text="Version 1.0.0", bg=C["bg"],
-                 fg=C["border"], font=("Segoe UI", 12)).pack()
+        image_path = Path(__file__).resolve().parent / "ChatGPT Image Jul 7, 2026, 12_28_22 AM.png"
+        if image_path.exists():
+            try:
+                self.welcome_image = tk.PhotoImage(file=str(image_path))
+                tk.Label(inner, image=self.welcome_image, bg=C["bg"]).pack(pady=(0, 20))
+            except Exception:
+                tk.Label(inner, text="MDAQ", bg=C["bg"], fg=C["text"],
+                         font=("Segoe UI", 56, "bold")).pack(pady=(0, 24))
+        else:
+            tk.Label(inner, text="MDAQ", bg=C["bg"], fg=C["text"],
+                     font=("Segoe UI", 56, "bold")).pack(pady=(0, 24))
+
 
     # ─────────────────────────────────────────────────────────────────────────
     #  HOME PAGE
@@ -546,7 +674,7 @@ class MDAQApp(tk.Tk):
         # header
         hdr = tk.Frame(f, bg=C["bg"])
         hdr.pack(fill="x", padx=32, pady=(20, 12))
-        back_btn = tk.Button(hdr, text="← Back", command=lambda: self._show_page("home"),
+        back_btn = tk.Button(hdr, text="← Back", command=self._go_back,
                   bg=C["border"], fg=C["accent"], font=("Segoe UI", 14, "bold"),
                   relief="flat", cursor="hand2", padx=14, pady=10,
                   activebackground=C["accent"], activeforeground=C["bg"],
@@ -599,12 +727,12 @@ class MDAQApp(tk.Tk):
                                  state="readonly", width=28)
             else:
                 var = tk.StringVar()
-                w = tk.Entry(card, textvariable=var, bg=C["entry_bg"],
-                             fg=C["text"], insertbackground=C["accent"],
-                             relief="flat", font=("Segoe UI", 13), width=30,
-                             highlightthickness=1,
-                             highlightcolor=C["accent"],
-                             highlightbackground=C["border"])
+                w = self._make_history_combobox(card, var, label, width=30)
+                w.configure(background=C["entry_bg"], foreground=C["text"], font=("Segoe UI", 13))
+                try:
+                    w.configure(insertbackground=C["accent"])
+                except Exception:
+                    pass
             w.grid(row=row, column=1, sticky="w", pady=10)
 
             hint_text = hint if isinstance(hint, str) else ""
@@ -657,8 +785,8 @@ class MDAQApp(tk.Tk):
             return False, "Name must be 1–50 characters."
         if not v["Age"].isdigit() or not (1 <= int(v["Age"]) <= 120):
             return False, "Age must be a number between 1 and 120."
-        if not re.fullmatch(r"[A-Z0-9]{16}", v["UHI ID"]):
-            return False, "UHI ID must be exactly 16 capital alphanumeric characters."
+        if not re.fullmatch(r"[A-Z0-9_]{16}", v["UHI ID"]):
+            return False, "UHI ID must be exactly 16 capital alphanumeric characters or underscore."
         if not re.fullmatch(r"MD[A-Z0-9]{8}", v["MDAQ ID"]):
             return False, "MDAQ ID must be 10 chars starting with 'MD' (e.g., MDTEST0001)."
         if not re.fullmatch(r"WD[A-Z0-9]{8}", v["WD ID"]):
@@ -686,6 +814,9 @@ class MDAQApp(tk.Tk):
         info = {k: var.get().strip() for k, (var, _) in self.si_vars.items()}
         pkt = PacketProtocol.build_register_bi(info)
         self.ble.write(pkt, "bi_register")
+        for key, value in info.items():
+            self._push_history_value(key, value)
+
         self.si_status.configure(text="⏳ Sending to device…", fg=self.C["subtext"])
         if not BLE_AVAILABLE:
             self.after(800, lambda: self._on_bi_registered(success=True))
@@ -755,7 +886,7 @@ class MDAQApp(tk.Tk):
 
         hdr = tk.Frame(f, bg=C["bg"])
         hdr.pack(fill="x", padx=32, pady=(20, 12))
-        back_btn = tk.Button(hdr, text="← Back", command=lambda: self._show_page("home"),
+        back_btn = tk.Button(hdr, text="← Back", command=self._go_back,
                   bg=C["border"], fg=C["accent"], font=("Segoe UI", 14, "bold"),
                   relief="flat", cursor="hand2", padx=14, pady=10,
                   activebackground=C["accent"], activeforeground=C["bg"],
@@ -776,27 +907,44 @@ class MDAQApp(tk.Tk):
         card_row.pack(fill="x", pady=(8, 0))
         card_row.columnconfigure(0, weight=1)
         card_row.columnconfigure(1, weight=1)
+        card_row.columnconfigure(2, weight=1)
 
         self._home_card(card_row, 0,
                         icon="👨‍🦲",
                         title="Register New Subject",
-                        desc= None,
+                        desc=None,
                         color=C["accent"],
                         cmd=lambda: self._show_page("subject"))
 
         self._home_card(card_row, 1,
                         icon="⏯️",
                         title="Start Screening",
-                        desc= None,
+                        desc=None,
                         color=C["success"],
                         cmd=self._start_screening_page)
 
+        self._home_card(card_row, 2,
+                        icon="🔄",
+                        title="Resume Screening",
+                        desc=None,
+                        color=C["accent2"],
+                        cmd=self._resume_screening_page)
 
     def _start_screening_page(self):
         if not self._ble_connected_state:
             messagebox.showwarning("No device", "Please connect to a device before starting screening.")
             return
 
+        self._enter_live_screening_mode("Starting new screening…", send_start_packet=True)
+
+    def _resume_screening_page(self):
+        if not self._ble_connected_state:
+            messagebox.showwarning("No device", "Please connect to a device before resuming screening.")
+            return
+
+        self._enter_live_screening_mode("Resuming screening… Listening for incoming packets.", send_start_packet=False)
+
+    def _enter_live_screening_mode(self, status_text: str, send_start_packet: bool):
         # Navigate to the live screening page
         self._show_page("screening_live")
 
@@ -804,24 +952,23 @@ class MDAQApp(tk.Tk):
         self.screening_session_active = True
         self.screening_packets = []
         self.screening_count = 0
-        # ensure live widgets exist
         if hasattr(self, "screening_live_text") and self.screening_live_text:
             self.screening_live_text.delete("1.0", "end")
         if hasattr(self, "screening_live_print_btn") and self.screening_live_print_btn:
             self.screening_live_print_btn.configure(state="disabled")
         if hasattr(self, "screening_live_status") and self.screening_live_status:
-            self.screening_live_status.configure(text="⏳ Waiting for screening packets…", fg=self.C["accent"])
+            self.screening_live_status.configure(text=f"⏳ {status_text}", fg=self.C["accent"])
 
-        pkt = PacketProtocol.build_start_screening()
-        self.ble.write(pkt, "start_screening")
+        if send_start_packet:
+            pkt = PacketProtocol.build_start_screening()
+            self.ble.write(pkt, "start_screening")
 
         if not BLE_AVAILABLE:
-                self._add_notification(
+            self._add_notification(
                 "BLE is not available. Cannot start screening.",
                 level="error"
-                )
-
-                return
+            )
+            return
 
     def _on_screening_data(self, payload: dict):
         self.screening_count += 1
@@ -837,7 +984,7 @@ class MDAQApp(tk.Tk):
         except Exception:
             dt = datetime.now()
         
-        date_str = dt.strftime("%m/%d/%Y")
+        date_str = dt.strftime("%d/%m/%Y")
         time_str = dt.strftime("%I:%M:%S %p")
         
         target_text = None
@@ -847,28 +994,23 @@ class MDAQApp(tk.Tk):
         if target_text:
             # Add header on first packet
             if self.screening_count == 1:
-                target_text.insert("end", f"{'Date':<12}{'Time':<12}{'Reading':<16}{'Alarm':<10}Channel\n")
+                target_text.insert("end", f"{'Date':<10}  {'Time':<15}  {'Reading':<13}  {'Alarm':<15}  {'Channel'}\n")
                 target_text.insert("end", "=" * 80 + "\n")
             
-            # Add all temperature readings for this packet
+            # Add all temperature readings for this packet (format readings to 4 decimals)
             temps = payload.get("temperature_data", [])
             for idx, val in enumerate(temps):
                 try:
-                    reading = f"{float(val):.4f}  C"
+                    reading = f"{float(val):.4f} C"
                 except Exception:
                     reading = str(val)
-                target_text.insert("end", f"{date_str:<12}{time_str:<12}{reading:<16}{'':<10}{idx+1}\n")
-            
-            target_text.see("end")
+                alarm = ""
+                target_text.insert("end", f"{date_str:<10}  {time_str:<15}  {reading:<13}  {alarm:<15}  {idx+1}\n")
 
-        if self.screening_count >= 10:
-            self.screening_session_active = False
-            if hasattr(self, "screening_live_text") and self.screening_live_text:
-                self.screening_live_text.insert("end", "\n" + "=" * 80 + "\n")
+            # Keep the live screening session active and continue appending incoming packets
+            # Update live status with current packet count
             if hasattr(self, "screening_live_status") and self.screening_live_status:
-                self.screening_live_status.configure(text="✓ Screening complete: 10 packets received.", fg=self.C["success"])
-            if hasattr(self, "screening_live_print_btn") and self.screening_live_print_btn:
-                self.screening_live_print_btn.configure(state="normal")
+                self.screening_live_status.configure(text=f"⏳ Receiving packets: {self.screening_count}", fg=self.C["accent"]) 
 
     def _print_screening_data(self):
         path = filedialog.asksaveasfilename(
@@ -923,7 +1065,7 @@ class MDAQApp(tk.Tk):
                  font=("Segoe UI", 15, "bold")).pack(anchor="w", pady=(0, 12))
 
         self.screening_live_text = scrolledtext.ScrolledText(card,
-            bg="#0A0E14", fg=C["accent2"], font=("Courier", 12), height=20, wrap="word")
+            bg="#0A0E14", fg=C["accent2"], font=("Courier", 12), height=20, wrap="none")
         self.screening_live_text.pack(fill="both", expand=True)
         self.screening_live_text.bind("<Key>", lambda e: "break")
         self.screening_live_text.bind("<Control-v>", lambda e: "break")
@@ -958,7 +1100,7 @@ class MDAQApp(tk.Tk):
 
         hdr = tk.Frame(f, bg=C["bg"])
         hdr.grid(row=0, column=0, columnspan=2, sticky="ew", padx=32, pady=(20, 12))
-        back_btn = tk.Button(hdr, text="← Back", command=lambda: self._show_page("home"),
+        back_btn = tk.Button(hdr, text="← Back", command=self._go_back,
                   bg=C["border"], fg=C["accent"], font=("Segoe UI", 14, "bold"),
                   relief="flat", cursor="hand2", padx=14, pady=10,
                   activebackground=C["accent"], activeforeground=C["bg"],
@@ -1048,7 +1190,7 @@ class MDAQApp(tk.Tk):
         # ---------------- Header ----------------
         hdr = tk.Frame(scroll_frame, bg=C["bg"])
         hdr.pack(fill="x", padx=32, pady=(20, 12))
-        back_btn = tk.Button(hdr, text="← Back", command=lambda: self._show_page("retrieve_options"),
+        back_btn = tk.Button(hdr, text="← Back", command=self._go_back,
                   bg=C["border"], fg=C["accent"], font=("Segoe UI", 14, "bold"),
                   relief="flat", cursor="hand2", padx=14, pady=10,
                   activebackground=C["accent"], activeforeground=C["bg"],
@@ -1068,17 +1210,15 @@ class MDAQApp(tk.Tk):
         uhi_row.pack(fill="x", pady=(0,12))
         tk.Label(uhi_row, text="UHI ID:", bg=C["panel"], fg=C["subtext"],
                  width=20, anchor="w", font=("Segoe UI", 13)).pack(side="left", padx=(0, 12))
-        self.patient_uhid_entry = tk.Entry(
-                                            uhi_row,
-                                            width=24,
-                                            bg=self.C["entry_bg"],
-                                            fg=self.C["text"],
-                                            insertbackground=self.C["text"],   # Cursor color
-                                            insertwidth=2,                     # Cursor thickness
-                                            font=("Segoe UI", 12)
-                                            )
+        self.patient_uhid_entry_var = tk.StringVar()
+        self.patient_uhid_entry = self._make_history_combobox(
+            uhi_row,
+            self.patient_uhid_entry_var,
+            "UHI ID",
+            width=30,
+            state="normal")
         self.patient_uhid_entry.pack(side="left", padx=(0,12))
-        tk.Label(uhi_row, text="(16 capital alphanumeric)", bg=C["panel"], fg=C["subtext"], font=("Segoe UI", 11)).pack(side="left")
+        tk.Label(uhi_row, text="(16 capital alphanumeric or underscore)", bg=C["panel"], fg=C["subtext"], font=("Segoe UI", 11)).pack(side="left")
 
         # Patient Info Display
         self.patient_info_display = {}
@@ -1125,8 +1265,8 @@ class MDAQApp(tk.Tk):
             messagebox.showwarning("Missing UHI", "Please enter the UHI ID on this page before retrieving.")
             return
 
-        if not re.fullmatch(r"[A-Z0-9]{16}", uhid):
-            messagebox.showwarning("Invalid UHI", "UHI ID must be exactly 16 capital alphanumeric characters.")
+        if not re.fullmatch(r"[A-Z0-9_]{16}", uhid):
+            messagebox.showwarning("Invalid UHI", "UHI ID must be exactly 16 capital alphanumeric characters or underscore.")
             return
 
         self.patient_request_uhid = uhid
@@ -1136,6 +1276,18 @@ class MDAQApp(tk.Tk):
                 text="⚠ Connect to a device first.", fg=self.C["warn"])
             return
 
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suggested = f"{uhid}_{ts}_PATIENT_INFO.txt"
+        path = filedialog.asksaveasfilename(defaultextension=".txt",
+                                            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")],
+                                            initialdir=self.settings["download_path"],
+                                            title="Save patient information as",
+                                            initialfile=suggested)
+        if not path:
+            self.patient_retrieve_status.configure(text="✗ Download cancelled.", fg=self.C["warn"])
+            return
+
+        self._pending_patient_info_path = path
         _send_request(uhid)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1165,12 +1317,8 @@ class MDAQApp(tk.Tk):
         tk.Label(card, text="UHI ID", bg=C["panel"], fg=C["text"],
                  font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 8))
         self.retrieve_uhid = tk.StringVar()
-        tk.Entry(card, textvariable=self.retrieve_uhid,
-                 bg=C["entry_bg"], fg=C["text"],
-                 insertbackground=C["accent"],
-                 relief="flat", font=("Segoe UI", 14), width=22,
-                 highlightthickness=1, highlightcolor=C["accent"],
-                 highlightbackground=C["border"]).pack(anchor="w", pady=(0, 24))
+        retrieve_combo = self._make_history_combobox(card, self.retrieve_uhid, "UHI ID", width=30)
+        retrieve_combo.pack(anchor="w", pady=(0, 24))
 
         tk.Button(card, text="⤓  Read & Retrieve Data",
                   command=self._retrieve_data,
@@ -1184,15 +1332,16 @@ class MDAQApp(tk.Tk):
 
     def _retrieve_data(self):
         uhid = self.retrieve_uhid.get().strip()
-        if not re.fullmatch(r"[A-Z0-9]{16}", uhid):
+        if not re.fullmatch(r"[A-Z0-9_]{16}", uhid):
             self.retrieve_status.configure(
-                text="⚠ UHI ID must be exactly 16 capital alphanumeric characters.",
+                text="⚠ UHI ID must be exactly 16 capital alphanumeric characters or underscore.",
                 fg=self.C["warn"])
             return
         if not self._ble_connected_state:
             self.retrieve_status.configure(text="⚠ Connect to a device first.", fg=self.C["warn"])
             return
 
+        self._push_history_value("UHI ID", uhid)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         suggested = f"{uhid}_{ts}_TEMP_DOWNLOAD.txt"
         path = filedialog.asksaveasfilename(defaultextension=".txt",
@@ -1204,8 +1353,11 @@ class MDAQApp(tk.Tk):
             self.retrieve_status.configure(text="✗ Download cancelled.", fg=self.C["warn"])
             return
 
+        self._pending_retrieve_uhid = uhid
         self._pending_retrieve_path = path
-        self.collecting_retrieve = True
+        self._pending_retrieve_wd_size = None
+        self._pending_retrieve_waiting_for_basic_info = True
+        self.collecting_retrieve = False
         self.retrieve_packets = []
         if getattr(self, "_retrieve_timer", None):
             try:
@@ -1214,16 +1366,45 @@ class MDAQApp(tk.Tk):
                 pass
             self._retrieve_timer = None
 
+        pkt = PacketProtocol.build_initiation()
+        self.ble.write(pkt, "retrieve_device_info")
+        self.retrieve_status.configure(text=f"⏳ Identifying WD size for {uhid} before retrieving data…", fg=self.C["subtext"])
+        if not BLE_AVAILABLE:
+            self._add_notification(
+                "BLE is not available. Cannot start screening.",
+                level="error"
+            )
+            return
+
+    def _continue_retrieve_after_basic_info(self):
+        """After WD size is known, begin the actual retrieve data request."""
+        self._pending_retrieve_waiting_for_basic_info = False
+        self.collecting_retrieve = True
+        self.retrieve_packets = []
+
+        if not getattr(self, "_pending_retrieve_uhid", None):
+            self.retrieve_status.configure(text="✗ Missing UHID; cannot retrieve data.", fg=self.C["danger"])
+            return
+
+        uhid = self._pending_retrieve_uhid
+        self.retrieve_status.configure(
+            text=f"⏳ Retrieving data for {uhid} (WD Size: {self._pending_retrieve_wd_size})…",
+            fg=self.C["subtext"])
         pkt = PacketProtocol.build_retrieve_data(uhid)
         self.ble.write(pkt, "retrieve_data")
-        self.retrieve_status.configure(text=f"⏳ Requesting data for {uhid}; saving to {Path(path).name}", fg=self.C["subtext"])
-        if not BLE_AVAILABLE:
-                self._add_notification(
-                    "BLE is not available. Cannot start screening.",
-                    level="error"
-                )
 
-                return
+    def _save_channel_mapping(self):
+        saved_map = {}
+        for size, vars_by_channel in self.channel_map_vars.items():
+            selected_channels = [idx for idx, var in vars_by_channel.items() if var.get() == 1]
+            if not selected_channels:
+                selected_channels = WD_CHANNELS.get(size, [])
+            saved_map[size] = sorted(selected_channels)
+
+        self.settings["channel_map"] = saved_map
+        save_settings(self.settings)
+        self.channel_map_status.configure(text="✓ Channel mapping saved.")
+        self.after(3000, lambda: self.channel_map_status.configure(text=""))
 
     def _on_retrieve_response(self, payload):
         if isinstance(payload, dict) and payload.get("type") == "retrieve_data":
@@ -1275,6 +1456,11 @@ class MDAQApp(tk.Tk):
         uhid = self.retrieve_uhid.get().strip() or "UNKNOWN"
         module_model = first.get("module_model", "2564")
         module_serial = first.get("module_serial", "B56626")
+        wd_size = getattr(self, "_pending_retrieve_wd_size", None) or "Full"
+        selected_channels = self.settings.get("channel_map", {}).get(wd_size)
+        if not isinstance(selected_channels, list) or not selected_channels:
+            selected_channels = WD_CHANNELS.get(wd_size, WD_CHANNELS["Full"])
+
         # use user-selected path if provided
         fpath = None
         fname = None
@@ -1288,28 +1474,46 @@ class MDAQApp(tk.Tk):
             outdir.mkdir(parents=True, exist_ok=True)
             fpath = outdir / fname
 
-        lines = [f"Module Model: {module_model}    Module Serial: {module_serial}", "", "=" * 80,
-                 f"{'Date':<12}{'Time':<12}{'Reading':<16}{'Alarm':<10}Channel", "=" * 80]
+        # Header for temperature download (include timestamp and device info)
+        header = f"Basic Info downloaded by MDAQ v1.2.0 Desktop GUI on {datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}"
+        sep = "=" * max(80, len(header))
+        # Prefer explicit values from the packet; fallback to last-known device info
+        device_id = first.get('device_id') or self.device_info.get('device_id') or 'MD.UNKNOWN'
+        wd_id = first.get('wd_id') or self.device_info.get('wd_id') or 'WD.UNKNOWN'
+        wd_size = getattr(self, '_pending_retrieve_wd_size', None) or first.get('wd_size') or self.device_info.get('wd_size') or 'Full'
+        validation = 'Pass' if (first.get('validation_status') or first.get('validation') or 0) == 1 else 'Fail'
+
+        lines = [header, sep, "",
+             f"Device ID\t: {device_id}",
+             f"WD ID\t\t: {wd_id}",
+             f"WD Size\t\t: {wd_size}",
+             f"Data Validation : {validation}",
+             "", sep, ""]
+
+        # Table header
+        lines += [f"{'Date':<10}\t{'Time':<11}\t{'Reading':<13}\t{'Alarm':<8}\t{'Channel'}", sep]
 
         for pkt in packets:
             date_time = pkt.get("date_time", "")
-            try:
-                if len(date_time) == 12 and date_time.isdigit():
-                    dt = datetime.strptime(date_time, "%d%m%y%H%M%S")
-                else:
-                    dt = datetime.now()
-            except Exception:
-                dt = datetime.now()
-
-            date_str = dt.strftime("%m/%d/%Y")
-            time_str = dt.strftime("%I:%M:%S %p")
-            temps = pkt.get("temperature_data", [])
-            for idx, val in enumerate(temps):
+            date_str = ""
+            time_str = ""
+            if isinstance(date_time, str) and len(date_time) >= 12 and date_time[:12].isdigit():
                 try:
-                    reading = f"{float(val):.4f}  C"
+                    dt = datetime.strptime(date_time[:12], "%d%m%y%H%M%S")
+                    date_str = dt.strftime("%d/%m/%Y")
+                    time_str = dt.strftime("%I:%M:%S %p")
                 except Exception:
-                    reading = str(val)
-                lines.append(f"{date_str:<12}{time_str:<12}{reading:<16}{'':<10}{idx+1}")
+                    date_str = ""
+                    time_str = ""
+            temps = pkt.get("temperature_data", [])
+            for ch in selected_channels:
+                if ch < len(temps):
+                    val = temps[ch]
+                    try:
+                        reading = f"{float(val):.4f} C"
+                    except Exception:
+                        reading = str(val)
+                    lines.append(f"{date_str:<10}\t{time_str:<11}\t{reading:<13}\t{'':<8}\t{ch+1}")
 
         lines += ["", "=" * 80]
 
@@ -1328,16 +1532,23 @@ class MDAQApp(tk.Tk):
 
     def _generate_text_file(self, bi: dict):
         wd_size = bi.get("WD Size", "Full")
-        channels_map = WD_CHANNELS.get(wd_size, WD_CHANNELS["Full"])
+        channels_map = self.settings.get("channel_map", {}).get(wd_size)
+        if not isinstance(channels_map, list) or not channels_map:
+            channels_map = WD_CHANNELS.get(wd_size, WD_CHANNELS["Full"])
 
         module_model = bi.get("Module Model", "2564")
         module_serial = bi.get("Module Serial", "B56626")
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         uhid = bi.get("UHID", "UNKNOWN")
-        fname = f"{uhid}_{ts}_BI.txt"
         outdir = Path(self.settings["download_path"])
         outdir.mkdir(parents=True, exist_ok=True)
+
+        # If `channels` is present, treat this as a temperature download
+        if isinstance(bi.get('channels'), dict):
+            fname = f"{uhid}_{ts}_TEMP_DOWNLOAD.txt"
+        else:
+            fname = f"{uhid}_{ts}_BI.txt"
         fpath = outdir / fname
 
         raw_channels = bi.get("channels", {})
@@ -1352,24 +1563,56 @@ class MDAQApp(tk.Tk):
 
         def format_record(index: int, channel: int, value):
             record_dt = dt + timedelta(seconds=index * 3)
-            date_str = record_dt.strftime("%m/%d/%Y")
+            date_str = record_dt.strftime("%d/%m/%Y")
             time_str = record_dt.strftime("%I:%M:%S %p")
-            reading = f"{value:.4f} C" if isinstance(value, (int, float)) else str(value)
-            return f"{date_str:<12}{time_str:<12}{reading:<16}{'':<10}{channel}"
+            try:
+                reading = f"{float(value):.4f} C"
+            except Exception:
+                reading = str(value)
+            return f"{date_str}\t{time_str}\t{reading}\t\t{channel}"
 
-        lines = [
-            f"Module Model: {module_model}    Module Serial: {module_serial}",
-            "",
-            "=" * 80,
-            f"{'Date':<12}{'Time':<12}{'Reading':<16}{'Alarm':<10}Channel",
-            "=" * 80,
-        ]
+
+        # Build header + device info for temperature download
+        header = f"Basic Info downloaded by MDAQ v1.2.0 Desktop GUI on {datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}"
+        sep = "=" * max(80, len(header))
+        device_id = bi.get('MDAQ ID') or bi.get('device_id') or self.device_info.get('device_id') or 'MD.UNKNOWN'
+        wd_id = bi.get('WD ID') or bi.get('wd_id') or self.device_info.get('wd_id') or 'WD.UNKNOWN'
+        wd_size = bi.get('WD Size') or bi.get('wd_size') or self.device_info.get('wd_size') or 'Full'
+        def _parse_validation_field(v):
+            try:
+                # bytes like b'1' or b'0'
+                if isinstance(v, (bytes, bytearray)):
+                    if len(v) == 1:
+                        # ASCII digit -> convert to 0/1
+                        return v[0] - 48 if 48 <= v[0] <= 57 else int(v[0])
+                    try:
+                        return int(v.decode(errors='ignore'))
+                    except Exception:
+                        return 0
+                # string like '1' or '0'
+                if isinstance(v, str):
+                    return int(v) if v.isdigit() else 0
+                # integer: could be actual 1/0 or ASCII code 49/48
+                if isinstance(v, int):
+                    if v in (48, 49):
+                        return v - 48
+                    return v
+            except Exception:
+                return 0
+            return 0
+
+        raw_val = bi.get('Data validity') if 'Data validity' in bi else bi.get('validation_status')
+        validation = 'Pass' if _parse_validation_field(raw_val) == 1 else 'Fail'
+
+        lines = [header, sep, "", f"Device ID\t: {device_id}", f"WD ID\t\t: {wd_id}", f"WD Size\t\t: {wd_size}", f"Data Validation : {validation}    // 1 = Pass, 0 = Fail (byte 210, Req type 5)", "", sep, ""]
+        lines += ["Date\tTime\tReading\tAlarm\tChannel", sep]
 
         for idx, ch in enumerate(channels_map):
             value = raw_channels.get(str(ch), 0.0)
-            lines.append(format_record(idx, ch, value))
+            # channel display numbers are 1-based
+            lines.append(format_record(idx, ch+1, value))
 
-        lines += ["", "=" * 80]
+        lines += ["", sep]
 
         with open(fpath, "w") as f:
             f.write("\n".join(lines))
@@ -1388,7 +1631,7 @@ class MDAQApp(tk.Tk):
         f.columnconfigure(0, weight=1)
         hdr = tk.Frame(f, bg=C["bg"])
         hdr.pack(fill="x", padx=32, pady=(20, 12))
-        back_btn = tk.Button(hdr, text="← Back", command=lambda: self._show_page("home"),
+        back_btn = tk.Button(hdr, text="← Back", command=self._go_back,
                   bg=C["border"], fg=C["accent"], font=("Segoe UI", 14, "bold"),
                   relief="flat", cursor="hand2", padx=14, pady=10,
                   activebackground=C["accent"], activeforeground=C["bg"],
@@ -1398,6 +1641,9 @@ class MDAQApp(tk.Tk):
         back_btn.bind("<Leave>", lambda e: back_btn.configure(bg=C["border"], fg=C["accent"]))
         tk.Label(hdr, text="Notifications", bg=C["bg"], fg=C["text"],
                  font=("Segoe UI", 24, "bold")).pack(side="left", padx=20)
+        tk.Button(hdr, text="CLEAR", command=self._clear_notifications,
+                  bg=C["border"], fg=C["subtext"], font=("Segoe UI", 12),
+                  relief="flat", padx=12, pady=8).pack(side="right")
 
         # make notifications scrollable with mousewheel
         canvas = tk.Canvas(f, bg=C["bg"], highlightthickness=0)
@@ -1435,6 +1681,13 @@ class MDAQApp(tk.Tk):
                      font=("Segoe UI", 13)).pack(side="left", padx=12)
             tk.Label(row, text=n["time"], bg=C["panel"], fg=C["subtext"],
                      font=("Segoe UI", 11)).pack(side="right")
+
+    def _clear_notifications(self):
+        self.notifications.clear()
+        self.unseen_notif_count = 0
+        self._refresh_notif_badge()
+        if getattr(self, "notif_container", None):
+            self._refresh_notifications()
 
     def _add_notification(self, msg: str, level: str = "info"):
         self.notifications.append({
@@ -1498,6 +1751,8 @@ class MDAQApp(tk.Tk):
         self._settings_card(scroll_frame, "Device Information", self._build_device_info_card)
         # ── file management card ─────────────────────────────────────────────
         self._settings_card(scroll_frame, "File Management", self._build_file_mgmt_card)
+        # ── channel mapping card ─────────────────────────────────────────────
+        self._settings_card(scroll_frame, "Channel Mapping", self._build_channel_mapping_card)
 
     def _settings_card(self, parent, title, builder):
         C = self.C
@@ -1573,6 +1828,52 @@ class MDAQApp(tk.Tk):
                   font=("Segoe UI", 12),
                   relief="flat", cursor="hand2", padx=14, pady=8).pack(side="left")
 
+    def _build_channel_mapping_card(self, parent):
+        C = self.C
+        tk.Label(parent, text="Configure which sensor channels are used for each WD size.",
+                 bg=C["panel"], fg=C["subtext"], font=("Segoe UI", 12), wraplength=640, justify="left").pack(anchor="w", pady=(0, 8))
+
+        btn_row = tk.Frame(parent, bg=C["panel"])
+        btn_row.pack(anchor="w")
+
+        tk.Button(btn_row, text="Open Channel Mapping",
+                  command=self._show_channel_mapping_page,
+                  bg=C["btn_bg"], fg=C["text"],
+                  font=("Segoe UI", 12, "bold"),
+                  relief="flat", cursor="hand2", padx=14, pady=8).pack(side="left")
+
+    def _build_about_page(self):
+        C = self.C
+        f = tk.Frame(self.content, bg=C["bg"])
+        self.pages["about"] = f
+        f.columnconfigure(0, weight=1)
+
+        hdr = tk.Frame(f, bg=C["bg"])
+        hdr.pack(fill="x", padx=32, pady=(20, 12))
+        back_btn = tk.Button(hdr, text="← Back", command=self._go_back,
+                  bg=C["border"], fg=C["accent"], font=("Segoe UI", 14, "bold"),
+                  relief="flat", cursor="hand2", padx=14, pady=10,
+                  activebackground=C["accent"], activeforeground=C["bg"],
+                  highlightthickness=0)
+        back_btn.pack(side="left")
+        back_btn.bind("<Enter>", lambda e: back_btn.configure(bg=C["accent"], fg=C["bg"]))
+        back_btn.bind("<Leave>", lambda e: back_btn.configure(bg=C["border"], fg=C["accent"]))
+        tk.Label(hdr, text="About", bg=C["bg"], fg=C["text"],
+                 font=("Segoe UI", 24, "bold")).pack(side="left", padx=20)
+
+        card = tk.Frame(f, bg=C["panel"], padx=32, pady=28)
+        card.pack(fill="both", expand=True, padx=32, pady=(0, 24))
+
+        about_text = (
+            "This application is designed for use with the Multichannel Data Acquisition (MDAQ) System developed by C-MET (Centre for Materials for Electronics Technology).\n\n"
+            "© 2026 C-MET. All rights reserved.\n\n"
+            "This software and related information are proprietary to C-MET and intended solely for authorized use. Unauthorized copying, modification, distribution, disclosure, or use is prohibited without prior written authorization from the Director General, C-MET, except as permitted by applicable law or agreement."
+        )
+
+        tk.Label(card, text=about_text, bg=C["panel"], fg=C["text"],
+                 font=("Segoe UI", 13), justify="left", anchor="nw",
+                 wraplength=760).pack(fill="both", expand=True)
+
     def _retrieve_device_info(self):
         """Retrieve device info using the initiation packet (Req_Type 0)"""
         if not self._ble_connected_state:
@@ -1581,6 +1882,88 @@ class MDAQApp(tk.Tk):
         pkt = PacketProtocol.build_initiation()
         self.ble.write(pkt, "retrieve_device_info")
         self.device_info_status.configure(text="⏳ Retrieving device info…")
+
+    def _show_channel_mapping_page(self):
+        self._show_page("channel_mapping")
+
+    def _build_channel_mapping_page(self):
+        C = self.C
+        f = tk.Frame(self.content, bg=C["bg"])
+        self.pages["channel_mapping"] = f
+        f.columnconfigure(0, weight=1)
+
+        hdr = tk.Frame(f, bg=C["bg"])
+        hdr.pack(fill="x", padx=32, pady=(20, 12))
+        back_btn = tk.Button(hdr, text="← Back", command=lambda: self._show_page("settings"),
+                  bg=C["border"], fg=C["accent"], font=("Segoe UI", 14, "bold"),
+                  relief="flat", cursor="hand2", padx=14, pady=10,
+                  activebackground=C["accent"], activeforeground=C["bg"],
+                  highlightthickness=0)
+        back_btn.pack(side="left")
+        back_btn.bind("<Enter>", lambda e: back_btn.configure(bg=C["accent"], fg=C["bg"]))
+        back_btn.bind("<Leave>", lambda e: back_btn.configure(bg=C["border"], fg=C["accent"]))
+        tk.Label(hdr, text="Channel Mapping", bg=C["bg"], fg=C["text"],
+                 font=("Segoe UI", 24, "bold")).pack(side="left", padx=20)
+
+        container = tk.Frame(f, bg=C["bg"])
+        container.pack(fill="both", expand=True, padx=32, pady=(0, 16))
+
+        canvas = tk.Canvas(container, bg=C["bg"], highlightthickness=0)
+        v_scroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        h_scroll = ttk.Scrollbar(container, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        v_scroll.pack(side="right", fill="y")
+        h_scroll.pack(side="bottom", fill="x")
+
+        grid_frame = tk.Frame(canvas, bg=C["bg"])
+        window_id = canvas.create_window((0, 0), window=grid_frame, anchor="nw")
+        grid_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(window_id, width=max(canvas.winfo_width(), grid_frame.winfo_reqwidth())))
+        try:
+            self._add_mousewheel_bindings(canvas)
+        except Exception:
+            pass
+
+        sizes = list(WD_CHANNELS.keys())
+        tk.Label(grid_frame, text="Channel", bg=C["bg"], fg=C["text"],
+                 font=("Segoe UI", 12, "bold"), width=10).grid(row=0, column=0, padx=8, pady=4)
+        for col, size in enumerate(sizes, start=1):
+            tk.Label(grid_frame, text=size, bg=C["bg"], fg=C["accent"],
+                     font=("Segoe UI", 12, "bold"), width=12).grid(row=0, column=col, padx=8, pady=4)
+
+        self.channel_map_vars = {size: {} for size in sizes}
+        for row in range(48):
+            tk.Label(grid_frame, text=str(row + 1), bg=C["bg"], fg=C["text"],
+                     font=("Segoe UI", 12), width=10).grid(row=row+1, column=0, padx=8, pady=2)
+            for col, size in enumerate(sizes, start=1):
+                val = 1 if row in self.settings["channel_map"].get(size, []) else 0
+                var = tk.IntVar(value=val)
+                cb = tk.Checkbutton(grid_frame, variable=var,
+                                    bg=C["bg"], fg=C["text"], activebackground=C["bg"],
+                                    activeforeground=C["text"], selectcolor=C["bg"],
+                                    highlightthickness=1, highlightbackground=C["accent"],
+                                    highlightcolor=C["accent"], bd=0, relief="flat",
+                                    font=("Segoe UI", 14), pady=4, padx=4,
+                                    onvalue=1, offvalue=0)
+                cb.grid(row=row+1, column=col, padx=6, pady=4)
+                self.channel_map_vars[size][row] = var
+
+        note = tk.Label(f, text="Select the active sensor channels for each WD size. Save to preserve your mapping.",
+                        bg=C["bg"], fg=C["subtext"], font=("Segoe UI", 12), wraplength=900, justify="left")
+        note.pack(anchor="w", padx=32, pady=(0, 8))
+
+        save_row = tk.Frame(f, bg=C["bg"])
+        save_row.pack(fill="x", padx=32, pady=(0, 16))
+        tk.Button(save_row, text="Save Channel Mapping",
+                  command=self._save_channel_mapping,
+                  bg=C["btn_bg"], fg=C["text"],
+                  font=("Segoe UI", 12, "bold"),
+                  relief="flat", cursor="hand2", padx=14, pady=10).pack(side="left")
+
+        self.channel_map_status = tk.Label(save_row, text="", bg=C["bg"], fg=C["success"],
+                                           font=("Segoe UI", 12))
+        self.channel_map_status.pack(side="left", padx=(12, 0))
 
     def _apply_device_info(self, payload: dict):
         """Apply patient info response (126-byte packet from Req_Type 4)"""
@@ -1595,7 +1978,7 @@ class MDAQApp(tk.Tk):
                 # Expected format: DDMMYYHHMMSS (12 chars)
                 if len(date_time_raw) >= 12 and date_time_raw[:12].isdigit():
                     dt = datetime.strptime(date_time_raw[:12], "%d%m%y%H%M%S")
-                    date_time_formatted = dt.strftime("%m/%d/%Y %I:%M:%S %p")
+                    date_time_formatted = dt.strftime("%d/%m/%Y\t%I:%M:%S %p")
                 else:
                     date_time_formatted = date_time_raw
             except Exception:
@@ -1614,6 +1997,64 @@ class MDAQApp(tk.Tk):
                 self.patient_info_display[k].configure(text=v)
         self.patient_retrieve_status.configure(text="✓ Patient information retrieved.")
 
+        # store device info for later use (used when building temp download headers)
+        try:
+            self.device_info.setdefault('device_id', payload.get('device_id'))
+            self.device_info.setdefault('wd_id', payload.get('wd_id'))
+            self.device_info.setdefault('wd_size', payload.get('wd_size'))
+        except Exception:
+            pass
+
+        if getattr(self, "_pending_patient_info_path", None):
+            self._save_patient_info_file(payload)
+
+    def _save_patient_info_file(self, payload: dict):
+        uhid = payload.get("uhi_id", self.patient_request_uhid or "UNKNOWN")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if getattr(self, "_pending_patient_info_path", None):
+            fpath = Path(self._pending_patient_info_path)
+            fname = fpath.name
+        else:
+            outdir = Path(self.settings["download_path"])
+            outdir.mkdir(parents=True, exist_ok=True)
+            fname = f"{uhid}_{ts}_PATIENT_INFO.txt"
+            fpath = outdir / fname
+
+        date_time_raw = payload.get('date_time', '—')
+        date_time_formatted = date_time_raw
+        if date_time_raw and date_time_raw != "—":
+            try:
+                if len(date_time_raw) >= 12 and date_time_raw[:12].isdigit():
+                    dt = datetime.strptime(date_time_raw[:12], "%d%m%y%H%M%S")
+                    date_time_formatted = dt.strftime("%d/%m/%Y\t%I:%M:%S %p")
+            except Exception:
+                date_time_formatted = date_time_raw
+
+        header = f"Basic Info downloaded by MDAQ Desktop GUI on {datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}"
+        sep = "=" * max(60, len(header))
+        lines = [header, sep, ""]
+        lines += [
+            f"Name: {payload.get('name', '—')}",
+            f"Age: {payload.get('subject_age', '—')}",
+            f"UHI ID: {uhid}",
+            f"MDAQ ID: {payload.get('device_id', '—')}",
+            f"WD Size: {payload.get('wd_size', '—')}",
+            f"WD ID: {payload.get('wd_id', '—')}",
+            f"Room Temperature: {payload.get('room_temperature', '—')}",
+            f"Body Temperature: {payload.get('body_temperature', '—')}",
+            f"Date & Time: {date_time_formatted}",
+        ]
+
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        try:
+            del self._pending_patient_info_path
+        except Exception:
+            pass
+
+        self.patient_retrieve_status.configure(text=f"✓ File saved: {fname}", fg=self.C["success"])
+
     def _apply_retrieve_device_info(self, payload: dict):
         """Apply device info response (30-byte packet from Req_Type 0)"""
         if not payload:
@@ -1630,6 +2071,30 @@ class MDAQApp(tk.Tk):
             if k in self.device_info_labels:
                 self.device_info_labels[k].configure(text=v)
         self.device_info_status.configure(text="✓ Device info updated.")
+
+        # store device info for later use when building retrieve headers
+        try:
+            if payload.get('device_id'):
+                self.device_info['device_id'] = payload.get('device_id')
+            if payload.get('wd_id'):
+                self.device_info['wd_id'] = payload.get('wd_id')
+            if payload.get('wd_size'):
+                self.device_info['wd_size'] = payload.get('wd_size')
+        except Exception:
+            pass
+
+        if getattr(self, "_pending_retrieve_waiting_for_basic_info", False):
+            self._pending_retrieve_wd_size = payload.get("wd_size", "Full") or "Full"
+            self.retrieve_status.configure(
+                text=f"⏳ WD size {self._pending_retrieve_wd_size} received. Preparing retrieve request…",
+                fg=self.C["subtext"])
+            if getattr(self, "_pending_retrieve_after_basic_info_timer", None):
+                try:
+                    self.after_cancel(self._pending_retrieve_after_basic_info_timer)
+                except Exception:
+                    pass
+                self._pending_retrieve_after_basic_info_timer = None
+            self._pending_retrieve_after_basic_info_timer = self.after(1500, self._continue_retrieve_after_basic_info)
         #self._add_notification("Device information retrieved.", level="info")
 
     def _find_device(self):
@@ -1679,8 +2144,66 @@ class MDAQApp(tk.Tk):
         self.connected_name = name
         self.ble.connect(addr)
 
+    def _stop_active_workflows(self):
+        if getattr(self, "screening_session_active", False):
+            self.screening_session_active = False
+            self.screening_packets = []
+            self.screening_count = 0
+            if getattr(self, "screening_live_status", None):
+                self.screening_live_status.configure(text="⚠ Screening aborted.", fg=self.C["warn"])
+            if getattr(self, "start_btn", None):
+                self.start_btn.configure(state="normal")
+            if getattr(self, "stop_btn", None):
+                self.stop_btn.configure(state="disabled")
+
+        if getattr(self, "collecting_retrieve", False) or getattr(self, "_pending_retrieve_waiting_for_basic_info", False):
+            self.collecting_retrieve = False
+            self._pending_retrieve_waiting_for_basic_info = False
+            self._pending_retrieve_uhid = None
+            self._pending_retrieve_path = None
+            self._pending_retrieve_wd_size = None
+            if getattr(self, "retrieve_status", None):
+                self.retrieve_status.configure(text="⚠ Retrieval aborted.", fg=self.C["warn"])
+            if getattr(self, "_retrieve_timer", None):
+                try:
+                    self.after_cancel(self._retrieve_timer)
+                except Exception:
+                    pass
+                self._retrieve_timer = None
+            if getattr(self, "_pending_retrieve_after_basic_info_timer", None):
+                try:
+                    self.after_cancel(self._pending_retrieve_after_basic_info_timer)
+                except Exception:
+                    pass
+                self._pending_retrieve_after_basic_info_timer = None
+
+        if getattr(self, "_pending_initiation_response", False):
+            self._pending_initiation_response = False
+            if getattr(self, "device_info_status", None):
+                self.device_info_status.configure(text="⚠ Pending device sync cancelled.", fg=self.C["warn"])
+
     def _ble_disconnect(self):
-        self.ble.disconnect()
+        self._stop_active_workflows()
+        if self._ble_connected_state or getattr(self.ble, 'client', None):
+            self.conn_label.configure(text="⏳ Disconnecting…", fg=self.C["subtext"])
+            self.disconnect_btn.configure(state="disabled")
+            self.scan_btn.configure(state="normal")
+            self._ble_connected_state = False
+            self.connected_address = ""
+            self.connected_name = ""
+        try:
+            self.ble.disconnect_and_wait(timeout=3.0)
+        except Exception:
+            self.ble.disconnect()
+
+    def _on_app_close(self):
+        self._stop_active_workflows()
+        try:
+            if getattr(self.ble, 'connected', False) or getattr(self.ble, 'client', None):
+                self.ble.disconnect_and_wait(timeout=2.0)
+        except Exception:
+            pass
+        self.destroy()
 
     # ─────────────────────────────────────────────────────────────────────────
     #  QUEUE POLL  – bridge async BLE events → tkinter UI
@@ -1743,8 +2266,10 @@ class MDAQApp(tk.Tk):
             self.disconnect_btn.configure(state="normal")
             self.scan_btn.configure(state="disabled")
             self._add_notification(f"Connected to {self.connected_name}.", level="success")
+            self._send_device_time_initiation()
 
         elif event == "ble_disconnected":
+            self._stop_active_workflows()
             self._ble_connected_state = False
             self.ble.client = None
             self.connected_address = ""
@@ -1766,7 +2291,7 @@ class MDAQApp(tk.Tk):
         elif event == "ble_notify":
             parsed: dict = payload
             self._monitor_log(f"RX: {parsed}")
-            # If packet carries an error_code, update UI; only notify for known codes once
+            # If packet carries an error_code, update UI and notify for every packet.
             ec = parsed.get("error_code")
             if ec is not None:
                 # Update device info UI if present
@@ -1775,14 +2300,15 @@ class MDAQApp(tk.Tk):
                         self.device_info_labels["Error Code"].configure(text=str(ec if ec != 0 else "—"))
                     except Exception:
                         pass
-                # Only notify for known error codes (in ERROR_CODE_MAP) and only once per connection
-                if ec != 0 and ec in self.ERROR_CODE_MAP and ec not in self._notified_error_codes:
-                    msg = f"Device reported error: {self.ERROR_CODE_MAP.get(ec)} (code {ec})"
+
+                if ec != 0:
+                    errors = self.decode_error_code(ec)
+                    if errors:
+                        joined = "; ".join(errors)
+                        msg = f"Device reported error(s): {joined} (code {ec})"
+                    else:
+                        msg = f"Device reported unknown error code: {ec}"
                     self._add_notification(msg, level="error")
-                    try:
-                        self._notified_error_codes.add(ec)
-                    except Exception:
-                        self._notified_error_codes = {ec}
             ptype = parsed.get("type")
             if ptype == "bi_ack":
                 self._on_bi_registered(parsed.get("error_code") == 0)
@@ -1810,8 +2336,14 @@ class MDAQApp(tk.Tk):
                     self._on_retrieve_response(parsed)
             elif ptype == "device_info":
                 self._apply_device_info(parsed)
+                if self._pending_initiation_response:
+                    self._on_initiation_response(parsed)
             elif ptype == "retrieve_device_info":
                 self._apply_retrieve_device_info(parsed)
+                if self._pending_initiation_response:
+                    self._on_initiation_response(parsed)
+            elif self._pending_initiation_response:
+                self._on_initiation_response(parsed)
             else:
                 self._monitor_log(f"Unhandled packet type: {ptype}")
 
@@ -1820,8 +2352,53 @@ class MDAQApp(tk.Tk):
             self._monitor_log(f"ACK: {key} = {payload.get('status')}")
 
         elif event == "ble_error":
+            if not payload:
+                payload = "Unknown BLE error."
+            if not self._ble_connected_state:
+                self.connected_name = ""
+                self.conn_label.configure(text="● Not connected", fg=C["danger"])
+                self.disconnect_btn.configure(state="disabled")
+                self.scan_btn.configure(state="normal")
             self._add_notification(f"BLE error: {payload}", level="error")
             messagebox.showerror("BLE Error", str(payload))
+
+    def _send_device_time_initiation(self):
+        if not self._ble_connected_state:
+            return
+
+        pkt = PacketProtocol.build_initiation()
+        self.ble.write(pkt, "device_time_init")
+        self._pending_initiation_response = True
+        self.device_info_status.configure(text="⌛ Syncing device clock…", fg=self.C["subtext"])
+
+        if getattr(self, "_pending_initiation_timer", None):
+            try:
+                self.after_cancel(self._pending_initiation_timer)
+            except Exception:
+                pass
+        self._pending_initiation_timer = self.after(2000, self._on_initiation_timeout)
+
+    def _on_initiation_response(self, parsed: dict):
+        if not self._pending_initiation_response:
+            return
+        self._pending_initiation_response = False
+        if getattr(self, "_pending_initiation_timer", None):
+            try:
+                self.after_cancel(self._pending_initiation_timer)
+            except Exception:
+                pass
+            self._pending_initiation_timer = None
+
+        self.device_info_status.configure(text="✓ Device clock set. Connected successfully.", fg=self.C["success"])
+        self._add_notification("Connected: Device Idle.", level="success")
+
+    def _on_initiation_timeout(self):
+        self._pending_initiation_timer = None
+        if not self._pending_initiation_response:
+            return
+        self._pending_initiation_response = False
+        self.device_info_status.configure(text="⚠ Device busy; still connected.", fg=self.C["warn"])
+        self._add_notification("Connected: Device Busy.", level="warn")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

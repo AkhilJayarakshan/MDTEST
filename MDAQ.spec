@@ -5,8 +5,13 @@ a = Analysis(
     ['gui.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=[
+        ('Logo.png', '.'),
+        ('Logo.ico', '.'),
+        ('Screenshot 2026-07-07 010121.png', '.'),
+        ('ChatGPT Image Jul 7, 2026, 12_28_22 AM.png', '.'),
+    ],
+    hiddenimports=['bleak', 'bleak.backends.winrt', 'bleak.backends.bluez'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -35,4 +40,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['Logo.ico'],
 )

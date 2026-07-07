@@ -1,4 +1,5 @@
 from datetime import datetime
+import math
 import struct
 
 
@@ -216,11 +217,40 @@ class PacketProtocol:
                         values.append(0.0)
                 return values
 
-            temperature_channels = parse_temps(">")
-            if all(v == 0.0 for v in temperature_channels) and any(b != 0 for b in data[18:210]):
-                little = parse_temps("<")
-                if any(v != 0.0 for v in little):
-                    temperature_channels = little
+            def count_valid(temps: list[float]) -> int:
+                valid = 0
+                for v in temps:
+                    if isinstance(v, float) and not math.isnan(v) and 0.0 <= v <= 150.0:
+                        valid += 1
+                return valid
+
+            little = parse_temps("<")
+            big = parse_temps(">")
+            little_valid = count_valid(little)
+            big_valid = count_valid(big)
+
+            temperature_channels = little if little_valid >= big_valid else big
+            if temperature_channels is big and little_valid > 0 and big_valid == 0:
+                temperature_channels = little
+
+            def _norm_validation_byte(v):
+                try:
+                    if isinstance(v, (bytes, bytearray)):
+                        if len(v) == 1:
+                            return v[0] - 48 if 48 <= v[0] <= 57 else int(v[0])
+                        try:
+                            return int(v.decode(errors='ignore'))
+                        except Exception:
+                            return 0
+                    if isinstance(v, int):
+                        if v in (48, 49):
+                            return v - 48
+                        return v
+                    if isinstance(v, str):
+                        return int(v) if v.isdigit() else 0
+                except Exception:
+                    return 0
+                return 0
 
             result.update({
                 "type": "retrieve_data",
@@ -229,7 +259,7 @@ class PacketProtocol:
                 "data_set": data[5],
                 "date_time": bytes(data[6:18]).decode("ascii", errors="ignore").rstrip("\x00"),
                 "temperature_data": temperature_channels,
-                "validation_status": data[210],
+                "validation_status": _norm_validation_byte(data[210]),
                 "battery_percentage": data[211],
                 "checksum": data[212],
             })

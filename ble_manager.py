@@ -19,6 +19,7 @@ class BLEManager:
         self.loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._connected: bool = False
+        self._disconnect_reported: bool = False
         self._start_loop()
 
     def _start_loop(self):
@@ -55,8 +56,14 @@ class BLEManager:
                 self.q.put(("ble_error", "Bleak library is not installed."))
                 return
 
-            # Create client
-            self.client = BleakClient(address)
+            # Reset disconnect reporting before starting a new connection
+            self._disconnect_reported = False
+
+            # Create client with callback for unexpected disconnect
+            try:
+                self.client = BleakClient(address, disconnected_callback=self._on_disconnect)
+            except TypeError:
+                self.client = BleakClient(address)
 
             # Connect to the device
             await self.client.connect()
@@ -70,20 +77,41 @@ class BLEManager:
             self._connected = True
             self.q.put(("ble_connected", address))
 
+            # Monitor connection state as a fallback
+            self.loop.create_task(self._connection_watcher())
+
         except Exception as e:
             self.q.put(("ble_error", str(e)))
 
     def disconnect(self):
         self._run(self._disconnect())
 
+    def disconnect_and_wait(self, timeout: float = 2.0):
+        try:
+            future = self._run(self._disconnect())
+            future.result(timeout=timeout)
+        except Exception:
+            pass
+
     async def _disconnect(self):
         try:
-            if BLE_AVAILABLE and self.client and self.client.is_connected:
-                await self.client.disconnect()
+            if BLE_AVAILABLE and self.client:
+                connected = self.client.is_connected
+                if asyncio.iscoroutine(connected):
+                    connected = await connected
+                if connected:
+                    await self.client.disconnect()
             self.client = None
             self._connected = False
-            self.q.put(("ble_disconnected", None))
+            if not self._disconnect_reported:
+                self._disconnect_reported = True
+                self.q.put(("ble_disconnected", None))
         except Exception as e:
+            self.client = None
+            self._connected = False
+            if not self._disconnect_reported:
+                self._disconnect_reported = True
+                self.q.put(("ble_disconnected", None))
             self.q.put(("ble_error", str(e)))
 
     def write(self, data: bytes, expect_response_key: str = ""):
@@ -98,6 +126,33 @@ class BLEManager:
                 return
         except Exception as e:
             self.q.put(("ble_error", str(e)))
+
+    async def _connection_watcher(self):
+        while BLE_AVAILABLE and self.client:
+            try:
+                current = self.client.is_connected
+                if asyncio.iscoroutine(current):
+                    current = await current
+                connected = bool(current)
+                if not connected:
+                    self._connected = False
+                    if not self._disconnect_reported:
+                        self._disconnect_reported = True
+                        self.q.put(("ble_disconnected", None))
+                    break
+            except Exception:
+                self._connected = False
+                if not self._disconnect_reported:
+                    self._disconnect_reported = True
+                    self.q.put(("ble_disconnected", None))
+                break
+            await asyncio.sleep(2.0)
+
+    def _on_disconnect(self, client):
+        self._connected = False
+        if not self._disconnect_reported:
+            self._disconnect_reported = True
+            self.q.put(("ble_disconnected", None))
 
     def _on_notify(self, sender, data: bytearray):
         from protocol import PacketProtocol

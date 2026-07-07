@@ -15,11 +15,14 @@ WD_CHANNELS = {
 
 
 def load_settings() -> dict:
-    defaults = {"download_path": str(Path.home() / "MDAQ_Data")}
+    defaults = {
+        "download_path": str(Path.home() / "MDAQ_Data"),
+        "history": {},
+        "channel_map": {},
+    }
     if SETTINGS_FILE.exists():
         try:
-            with open(SETTINGS_FILE) as f:
-                return {**defaults, **json.load(f)}
+            return {**defaults, **json.load(SETTINGS_FILE.open())}
         except Exception:
             pass
     return defaults
