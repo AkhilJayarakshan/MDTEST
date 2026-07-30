@@ -289,50 +289,60 @@ class MDAQApp(tk.Tk):
         C = self.C
         sb = self.sidebar
 
-        # logo area
+        # Logo area
         logo_frame = tk.Frame(sb, bg=C["panel"], pady=18)
         logo_frame.pack(fill="x")
-        # Try multiple possible logo image filenames (user-provided screenshot preferred)
-        logo_dir = Path(__file__).resolve().parent
-        candidates = [
-            logo_dir / "Screenshot 2026-07-07 010121.png",
-            logo_dir / "ChatGPT Image Jul 7, 2026, 12_28_22 AM.png",
-            logo_dir / "ChatGPT Image Jul 5, 2026, 11_10_34 PM.png",
-        ]
-        found = None
-        for p in candidates:
-            if p.exists():
-                found = p
-                break
-        if not found:
-            # fallback to any Screenshot*.png in the folder
-            for p in logo_dir.glob("Screenshot*.png"):
-                found = p
-                break
-        if found:
+
+        logo_path = Path(__file__).resolve().parent / "SideBar.png"
+
+        if logo_path.exists():
             try:
-                img = tk.PhotoImage(file=str(found))
+                img = tk.PhotoImage(file=str(logo_path))
+
                 max_width = 360
                 max_height = 120
                 w, h = img.width(), img.height()
+
                 scale_w = math.ceil(w / max_width) if w > max_width else 1
                 scale_h = math.ceil(h / max_height) if h > max_height else 1
-                scale = max(1, scale_w, scale_h)
+                scale = max(scale_w, scale_h, 1)
+
                 if scale > 1:
                     img = img.subsample(scale, scale)
+
                 self.sidebar_logo = img
-                tk.Label(logo_frame, image=self.sidebar_logo, bg=C["panel"]).pack()
+                tk.Label(
+                    logo_frame,
+                    image=self.sidebar_logo,
+                    bg=C["panel"]
+                ).pack()
+
             except Exception:
-                tk.Label(logo_frame, text="⬡ MDAQ", bg=C["panel"],
-                     fg=C["accent"], font=("Segoe UI", 28, "bold")).pack()
+                tk.Label(
+                    logo_frame,
+                    text="⬡ MDAQ",
+                    bg=C["panel"],
+                    fg=C["accent"],
+                    font=("Segoe UI", 28, "bold")
+                ).pack()
         else:
-            tk.Label(logo_frame, text="⬡ MDAQ", bg=C["panel"],
-                 fg=C["accent"], font=("Segoe UI", 28, "bold")).pack()
-        tk.Label(logo_frame, text="v1.2.0", bg=C["panel"],
-             fg=C["subtext"], font=("Segoe UI", 11)).pack()
+            tk.Label(
+                logo_frame,
+                text="⬡ MDAQ",
+                bg=C["panel"],
+                fg=C["accent"],
+                font=("Segoe UI", 28, "bold")
+            ).pack()
+
+        tk.Label(
+            logo_frame,
+            text="v1.2.0",
+            bg=C["panel"],
+            fg=C["subtext"],
+            font=("Segoe UI", 11)
+        ).pack()
 
         ttk.Separator(sb, orient="horizontal").pack(fill="x", padx=10)
-
         # ── BLE section ──────────────────────────────────────────────────────
         ble_frame = tk.Frame(sb, bg=C["panel"], pady=10, padx=12)
         ble_frame.pack(fill="x")
@@ -590,7 +600,7 @@ class MDAQApp(tk.Tk):
         inner = tk.Frame(f, bg=C["bg"])
         inner.place(relx=0.5, rely=0.5, anchor="center")
 
-        image_path = Path(__file__).resolve().parent / "ChatGPT Image Jul 7, 2026, 12_28_22 AM.png"
+        image_path = Path(__file__).resolve().parent / "Startup.png"
         if image_path.exists():
             try:
                 self.welcome_image = tk.PhotoImage(file=str(image_path))
@@ -1491,7 +1501,7 @@ class MDAQApp(tk.Tk):
              "", sep, ""]
 
         # Table header
-        lines += [f"{'Date':<10}\t{'Time':<11}\t{'Reading':<13}\t{'Alarm':<8}\t{'Channel'}", sep]
+        lines += [f"{'Date':<10}\t{'Time':<11}\t{'Reading':<13}\t{'Alarm':<8}\t{'Channel'}"]
 
         for pkt in packets:
             date_time = pkt.get("date_time", "")
@@ -1515,7 +1525,7 @@ class MDAQApp(tk.Tk):
                         reading = str(val)
                     lines.append(f"{date_str:<10}\t{time_str:<11}\t{reading:<13}\t{'':<8}\t{ch+1}")
 
-        lines += ["", "=" * 80]
+        #lines += ["", "=" * 80]
 
         with open(fpath, "w") as f:
             f.write("\n".join(lines))
@@ -2311,7 +2321,7 @@ class MDAQApp(tk.Tk):
                     self._add_notification(msg, level="error")
             ptype = parsed.get("type")
             if ptype == "bi_ack":
-                self._on_bi_registered(parsed.get("error_code") == 0)
+                self._on_bi_registered(True)
             elif ptype == "start_screening_ack":
                 if parsed.get("error_code") == 0:
                     self._on_screening_started()
