@@ -940,12 +940,83 @@ class MDAQApp(tk.Tk):
                         color=C["accent2"],
                         cmd=self._resume_screening_page)
 
+    def _confirm_start_screening(self) -> str:
+        dialog = tk.Toplevel(self)
+        dialog.title("Confirm Start Screening")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.configure(bg="SystemButtonFace")
+
+        body = tk.Frame(dialog, bg="SystemButtonFace", padx=20, pady=20)
+        body.pack(fill="both", expand=True)
+
+        icon_label = tk.Label(body, text="?", font=("Segoe UI", 28, "bold"),
+                              bg="SystemButtonFace", fg="#2B579A")
+        icon_label.grid(row=0, column=0, sticky="n", padx=(0, 14), pady=4)
+
+        tk.Label(body,
+                 text=("Please confirm that the patient data has been registered before starting the screening. "
+                       "If not, register the patient data first."),
+                 wraplength=420,
+                 justify="left",
+                 bg="SystemButtonFace",
+                 fg="black",
+                 font=("Segoe UI", 11)).grid(row=0, column=1, sticky="w", pady=4)
+
+        btn_frame = tk.Frame(dialog, bg="SystemButtonFace", pady=16)
+        btn_frame.pack(fill="x")
+
+        choice = {"value": "cancel"}
+
+        def on_confirm():
+            choice["value"] = "confirm"
+            dialog.destroy()
+
+        def on_register():
+            choice["value"] = "register"
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        tk.Button(btn_frame, text="Confirm & Start Screening", command=on_confirm,
+                  bg="SystemButtonFace", fg="black", relief="raised",
+                  font=("Segoe UI", 11, "bold"), padx=16, pady=8).pack(side="left", padx=(0, 8))
+        tk.Button(btn_frame, text="Register Patient", command=on_register,
+                  bg="SystemButtonFace", fg="black", relief="raised",
+                  font=("Segoe UI", 11), padx=16, pady=8).pack(side="left", padx=(0, 8))
+        tk.Button(btn_frame, text="Cancel", command=on_cancel,
+                  bg="SystemButtonFace", fg="black", relief="raised",
+                  font=("Segoe UI", 11), padx=16, pady=8).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+        dialog.update_idletasks()
+
+        parent_x = self.winfo_rootx()
+        parent_y = self.winfo_rooty()
+        parent_w = self.winfo_width()
+        parent_h = self.winfo_height()
+        dlg_w = dialog.winfo_width()
+        dlg_h = dialog.winfo_height()
+        pos_x = parent_x + (parent_w - dlg_w) // 2
+        pos_y = parent_y + (parent_h - dlg_h) // 2
+        dialog.geometry(f"+{pos_x}+{pos_y}")
+
+        dialog.wait_window()
+        return choice["value"]
+
     def _start_screening_page(self):
         if not self._ble_connected_state:
             messagebox.showwarning("No device", "Please connect to a device before starting screening.")
             return
 
-        self._enter_live_screening_mode("Starting new screening…", send_start_packet=True)
+        action = self._confirm_start_screening()
+        if action == "confirm":
+            self._enter_live_screening_mode("Starting new screening…", send_start_packet=True)
+        elif action == "register":
+            self._show_page("subject")
+        # if cancel, do nothing
 
     def _resume_screening_page(self):
         if not self._ble_connected_state:
@@ -1058,7 +1129,7 @@ class MDAQApp(tk.Tk):
 
         hdr = tk.Frame(f, bg=C["bg"])
         hdr.pack(fill="x", padx=32, pady=(20, 12))
-        back_btn = tk.Button(hdr, text="← Back", command=lambda: self._show_page("screening"),
+        back_btn = tk.Button(hdr, text="← Back", command=self._go_back,
                   bg=C["border"], fg=C["accent"], font=("Segoe UI", 14, "bold"),
                   relief="flat", cursor="hand2", padx=14, pady=10,
                   activebackground=C["accent"], activeforeground=C["bg"],
@@ -1077,7 +1148,7 @@ class MDAQApp(tk.Tk):
         self.screening_live_text = scrolledtext.ScrolledText(card,
             bg="#0A0E14", fg=C["accent2"], font=("Courier", 12), height=20, wrap="none")
         self.screening_live_text.pack(fill="both", expand=True)
-        self.screening_live_text.bind("<Key>", lambda e: "break")
+        self.screening_live_text.bind("<Key>", lambda e: None if (e.state & 0x4 and e.keysym.lower() == "c") else "break")
         self.screening_live_text.bind("<Control-v>", lambda e: "break")
         self.screening_live_text.bind("<Control-x>", lambda e: "break")
         try:
@@ -1310,7 +1381,7 @@ class MDAQApp(tk.Tk):
 
         hdr = tk.Frame(f, bg=C["bg"])
         hdr.pack(fill="x", padx=32, pady=(20, 12))
-        back_btn = tk.Button(hdr, text="← Back", command=lambda: self._show_page("home"),
+        back_btn = tk.Button(hdr, text="← Back", command=self._go_back,
                   bg=C["border"], fg=C["accent"], font=("Segoe UI", 14, "bold"),
                   relief="flat", cursor="hand2", padx=14, pady=10,
                   activebackground=C["accent"], activeforeground=C["bg"],
@@ -1403,7 +1474,28 @@ class MDAQApp(tk.Tk):
         pkt = PacketProtocol.build_retrieve_data(uhid)
         self.ble.write(pkt, "retrieve_data")
 
+    def _confirm_save_channel_mapping(self) -> bool:
+        return messagebox.askokcancel(
+            "Confirm Channel Mapping",
+            "The new channel mapping will overwrite the previous configuration and affect temperature data files generated afterward. Do you want to save it?",
+            parent=self
+        )
+
     def _save_channel_mapping(self):
+        saved_channel_map = self.settings.get("channel_map", {})
+        previous_map = {
+            size: set(saved_channel_map.get(size, WD_CHANNELS.get(size, [])))
+            for size in self.channel_map_vars.keys()
+        }
+
+        if not self._confirm_save_channel_mapping():
+            for size, vars_by_channel in self.channel_map_vars.items():
+                saved_channels = previous_map.get(size, set())
+                for idx, var in vars_by_channel.items():
+                    var.set(1 if idx in saved_channels else 0)
+            self.update_idletasks()
+            return
+
         saved_map = {}
         for size, vars_by_channel in self.channel_map_vars.items():
             selected_channels = [idx for idx, var in vars_by_channel.items() if var.get() == 1]
@@ -2108,6 +2200,21 @@ class MDAQApp(tk.Tk):
         #self._add_notification("Device information retrieved.", level="info")
 
     def _find_device(self):
+        if not self._ble_connected_state:
+            if not BLE_AVAILABLE:
+                messagebox.showwarning(
+                    "Bluetooth unavailable",
+                    "Bluetooth support is not available. Please install the Bleak library and enable Bluetooth, then connect to a device from the scanner pane."
+                )
+                return
+
+            messagebox.showinfo(
+                "Connect to device",
+                "No device is connected. Scan for a nearby device and connect before using find device."
+            )
+            self._ble_scan()
+            return
+
         pkt = PacketProtocol.build_find_device()
         self.ble.write(pkt, "find_device")
         #self._add_notification("Find Device command sent (buzzer activated).", level="info")
